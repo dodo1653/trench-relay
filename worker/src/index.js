@@ -16,7 +16,7 @@ const PIN_MS = 2 * 3600 * 1000
 
 export default {
   async fetch(req, env) {
-    const stub = env.RELAY.get(env.RELAY.idFromName("main7"))
+    const stub = env.RELAY.get(env.RELAY.idFromName("main8"))
     return stub.fetch(req)
   },
 }
@@ -67,6 +67,31 @@ function curveOf(mint) {
 const WSOL = "So11111111111111111111111111111111111111112"
 function solPairs(pairs, mint) {
   return (Array.isArray(pairs) ? pairs : []).filter((x) => x && x.baseToken && x.baseToken.address === mint && x.quoteToken && x.quoteToken.address === WSOL && +x.priceNative > 0)
+}
+
+// Real chart history for a coin (2026-10-23, user: proper chart history on live coins). pump.fun's own candle API first
+// (1 m and 1 s bars, price in SOL per token, the newest `limit` bars), GeckoTerminal's pool OHLCV as a fallback for 1 m.
+// Rows come back as [t (s), o, h, l, c, v (SOL)], oldest first.
+const UA = { "user-agent": "Mozilla/5.0 (trench-relay)", accept: "application/json" }
+async function pumpCandles(mint, interval, createdMs) {
+  const since = Math.floor(createdMs || Date.now() - 7 * 86400e3)
+  const r = await fetch(`https://swap-api.pump.fun/v2/coins/${mint}/candles?interval=${interval}&limit=1000&currency=SOL&createdTs=${since}`, { headers: UA })
+  if (!r.ok) return null
+  const a = await r.json()
+  if (!Array.isArray(a)) return null
+  return a.map((k) => [Math.floor(+k.timestamp / 1000), +k.open, +k.high, +k.low, +k.close, +k.volume || 0])
+    .filter((k) => k[0] > 0 && k[4] > 0).sort((x, y) => x[0] - y[0])
+}
+async function geckoMinutes(mint) {
+  const r = await fetch(`https://api.geckoterminal.com/api/v2/networks/solana/tokens/${mint}/pools`, { headers: UA })
+  if (!r.ok) return null
+  const pools = ((await r.json()).data || [])
+  const pool = pools[0] && pools[0].attributes && pools[0].attributes.address
+  if (!pool) return null
+  const o = await fetch(`https://api.geckoterminal.com/api/v2/networks/solana/pools/${pool}/ohlcv/minute?aggregate=1&limit=1000&currency=token&token=base`, { headers: UA })
+  if (!o.ok) return null
+  const list = (((await o.json()).data || {}).attributes || {}).ohlcv_list || []
+  return list.map((k) => [k[0], +k[1], +k[2], +k[3], +k[4], +k[5] || 0]).filter((k) => k[4] > 0).sort((x, y) => x[0] - y[0])
 }
 
 export class Relay extends DurableObject {
@@ -271,6 +296,21 @@ export class Relay extends DurableObject {
       if (!c) return json(404, { error: "unknown" })
       c.pinnedUntil = Date.now() + PIN_MS
       return json(200, this.view(c, 0))
+    }
+    if (u.pathname === "/v1/history") {
+      const mint = u.searchParams.get("mint") || ""
+      if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) return json(400, { error: "mint" })
+      this.hist = this.hist || new Map()
+      const hit = this.hist.get(mint)
+      if (hit && Date.now() - hit.at < 30000) return json(200, hit.body)
+      const c = this.coins.get(mint)
+      let m1 = null, s1 = null, src = "pump"
+      try { [m1, s1] = await Promise.all([pumpCandles(mint, "1m", c && c.createdAt), pumpCandles(mint, "1s", c && c.createdAt)]) } catch {}
+      if (!m1 || !m1.length) { src = "gecko"; try { m1 = await geckoMinutes(mint) } catch {} }
+      const body = { mint, src, now: Math.floor(Date.now() / 1000), m1: m1 || [], s1: s1 || [] }
+      this.hist.set(mint, { at: Date.now(), body })
+      if (this.hist.size > 300) this.hist.delete(this.hist.keys().next().value)
+      return json(200, body)
     }
     if (u.pathname === "/" || u.pathname === "/health") {
       return json(200, { ok: true, tracked: this.coins.size, published: [...this.coins.values()].filter((c) => c.published).length, seq: this.seq, socket: this.ws ? (this.ws === "connecting" ? "connecting" : "open") : "closed", rpcOk: this.rpcOk || 0, lastMsgAgo: this.lastMsg ? Date.now() - this.lastMsg : null, reconnects: this.reconnects || 0, lastErr: this.lastErr || null, errs: this.errs || null, ticks: this.tickN })
