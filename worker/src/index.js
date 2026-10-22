@@ -6,7 +6,7 @@ import { DurableObject } from "cloudflare:workers"
 import { Buffer } from "node:buffer"
 import crypto from "node:crypto"
 
-const RPC = "https://api.mainnet-beta.solana.com"
+const RPCS = ["https://solana-rpc.publicnode.com", "https://api.mainnet.solana.com", "https://api.mainnet-beta.solana.com"]   // the beta endpoint blocks Cloudflare
 const TICK_MS = 4000
 const IDLE_MS = 10 * 60 * 1000
 const MAX_TRACK = 160
@@ -16,7 +16,7 @@ const PIN_MS = 2 * 3600 * 1000
 
 export default {
   async fetch(req, env) {
-    const stub = env.RELAY.get(env.RELAY.idFromName("main"))
+    const stub = env.RELAY.get(env.RELAY.idFromName("main5"))
     return stub.fetch(req)
   },
 }
@@ -65,6 +65,7 @@ function curveOf(mint) {
 export class Relay extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env)
+    this.env = env
     this.seq = 0
     this.coins = new Map()
     this.dropped = []
@@ -124,8 +125,19 @@ export class Relay extends DurableObject {
 
   // ------------------------------------------------ prices
   async rpc(method, params) {
-    const r = await fetch(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) })
-    const j = await r.json()
+    let last
+    const list = this.env.RPC_URL ? [this.env.RPC_URL] : RPCS
+    for (let i = 0; i < list.length; i++) {
+      const url = list[((this.rpcIdx || 0) + i) % list.length]
+      try { const out = await this.rpcAt(url, method, params); this.rpcIdx = list.indexOf(url); return out } catch (e) { last = e; (this.errs = this.errs || {})[this.env.RPC_URL ? 'keyed' : url] = String(e).slice(0, 140) }
+    }
+    throw last
+  }
+  async rpcAt(url, method, params) {
+    const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) })
+    const txt = await r.text()
+    let j
+    try { j = JSON.parse(txt) } catch { throw new Error("rpc " + r.status + " " + txt.slice(0, 120)) }
     if (j.error) throw new Error(j.error.message)
     return j.result
   }
@@ -136,11 +148,19 @@ export class Relay extends DurableObject {
     c.mc = mc; c.lastMove = now; c.seq = ++this.seq
   }
   async pollCurves() {
-    const list = [...this.coins.values()].filter((c) => !c.complete && c.curve)
-    for (let i = 0; i < list.length; i += 100) {
-      const batch = list.slice(i, i + 100)
+    // publicnode (the free RPC that lets Cloudflare in) takes 10 accounts a call: every published coin each round (60 max,
+    // freshest moves first), the not-yet-published ones 20 at a time in rotation
+    const open = [...this.coins.values()].filter((c) => !c.complete && c.curve)
+    const big = !!this.env.RPC_URL
+    const pub = open.filter((c) => c.published).sort((a, b) => b.lastMove - a.lastMove).slice(0, big ? 120 : 60)
+    const rest = open.filter((c) => !c.published)
+    this.rot = ((this.rot || 0) + 20) % Math.max(rest.length, 1)
+    const list = big ? pub.concat(rest) : pub.concat(rest.slice(this.rot, this.rot + 20))
+    const per = big ? 100 : 10
+    for (let i = 0; i < list.length; i += per) {
+      const batch = list.slice(i, i + per)
       let res
-      try { res = await this.rpc("getMultipleAccounts", [batch.map((c) => c.curve), { encoding: "base64" }]) } catch { return }
+      try { res = await this.rpc("getMultipleAccounts", [batch.map((c) => c.curve), { encoding: "base64" }]); this.rpcOk = (this.rpcOk || 0) + 1 } catch (e) { this.lastErr = String(e).slice(0, 200); return }
       res.value.forEach((acc, j) => {
         const c = batch[j]
         if (!acc) return
@@ -239,7 +259,7 @@ export class Relay extends DurableObject {
       return json(200, this.view(c, 0))
     }
     if (u.pathname === "/" || u.pathname === "/health") {
-      return json(200, { ok: true, tracked: this.coins.size, published: [...this.coins.values()].filter((c) => c.published).length, seq: this.seq, socket: this.ws ? (this.ws === "connecting" ? "connecting" : "open") : "closed" })
+      return json(200, { ok: true, tracked: this.coins.size, published: [...this.coins.values()].filter((c) => c.published).length, seq: this.seq, socket: this.ws ? (this.ws === "connecting" ? "connecting" : "open") : "closed", rpcOk: this.rpcOk || 0, lastErr: this.lastErr || null, errs: this.errs || null, ticks: this.tickN })
     }
     return json(404, { error: "not found" })
   }
