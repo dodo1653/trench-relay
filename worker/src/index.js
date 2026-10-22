@@ -7,16 +7,16 @@ import { Buffer } from "node:buffer"
 import crypto from "node:crypto"
 
 const RPCS = ["https://solana-rpc.publicnode.com", "https://api.mainnet.solana.com", "https://api.mainnet-beta.solana.com"]   // the beta endpoint blocks Cloudflare
-const TICK_MS = 4000
+const TICK_MS = 3000
 const IDLE_MS = 10 * 60 * 1000
 const MAX_TRACK = 160
-const MIN_REAL_SOL = 0.25
+const MIN_REAL_SOL = 0.1
 const KEEP_TICKS = 300
 const PIN_MS = 2 * 3600 * 1000
 
 export default {
   async fetch(req, env) {
-    const stub = env.RELAY.get(env.RELAY.idFromName("main5"))
+    const stub = env.RELAY.get(env.RELAY.idFromName("main7"))
     return stub.fetch(req)
   },
 }
@@ -85,11 +85,12 @@ export class Relay extends DurableObject {
         if (!ws) throw new Error("no websocket")
         ws.accept()
         ws.send(JSON.stringify({ method: "subscribeNewToken" }))
-        ws.addEventListener("message", (e) => this.onLaunch(e.data))
+        ws.addEventListener("message", (e) => { this.lastMsg = Date.now(); this.onLaunch(e.data) })
         const drop = () => { if (this.ws === ws) this.ws = null }
         ws.addEventListener("close", drop)
         ws.addEventListener("error", drop)
         this.ws = ws
+        this.lastMsg = Date.now()
       } catch (e) {
         console.log('pumpportal connect failed', String(e))
         this.ws = null
@@ -103,11 +104,13 @@ export class Relay extends DurableObject {
     if (Math.abs((m.vSolInBondingCurve || 0) - 30 - (m.solAmount || 0)) > 2 && m.vSolInBondingCurve !== 30) return
     const name = String(m.name || "").trim().slice(0, 32), symbol = String(m.symbol || "").trim().slice(0, 12)
     if (!name || !symbol) return
-    this.coins.set(m.mint, {
+    const c = {
       mint: m.mint, curve: m.bondingCurveKey, name, symbol, createdAt: Date.now(),
-      vSol: m.vSolInBondingCurve || 30, vTok: m.vTokensInBondingCurve || 1073000000, rSol: 0, complete: false,
+      vSol: m.vSolInBondingCurve || 30, vTok: m.vTokensInBondingCurve || 1073000000, rSol: Math.max(0, (m.vSolInBondingCurve || 30) - 30), complete: false,
       mc: m.marketCapSol || 28, published: false, seq: 0, ticks: [], lastMove: Date.now(), pinnedUntil: 0,
-    })
+    }
+    this.coins.set(m.mint, c)
+    if (c.rSol >= MIN_REAL_SOL) { c.published = true; this.tick(c, c.mc) }
     this.prune()
   }
   score(c) { return (c.published ? 1e6 : 0) + c.mc * 1000 - (Date.now() - c.lastMove) / 1000 }
@@ -230,6 +233,10 @@ export class Relay extends DurableObject {
       this.ws = null
       return   // asleep until the next request
     }
+    if (this.ws && this.ws !== "connecting" && Date.now() - (this.lastMsg || 0) > 45000) {
+      try { this.ws.close() } catch {}
+      this.ws = null; this.reconnects = (this.reconnects || 0) + 1
+    }
     this.connect()
     await this.pollCurves()
     if (++this.tickN % 8 === 0) await this.pollGraduated()
@@ -259,7 +266,7 @@ export class Relay extends DurableObject {
       return json(200, this.view(c, 0))
     }
     if (u.pathname === "/" || u.pathname === "/health") {
-      return json(200, { ok: true, tracked: this.coins.size, published: [...this.coins.values()].filter((c) => c.published).length, seq: this.seq, socket: this.ws ? (this.ws === "connecting" ? "connecting" : "open") : "closed", rpcOk: this.rpcOk || 0, lastErr: this.lastErr || null, errs: this.errs || null, ticks: this.tickN })
+      return json(200, { ok: true, tracked: this.coins.size, published: [...this.coins.values()].filter((c) => c.published).length, seq: this.seq, socket: this.ws ? (this.ws === "connecting" ? "connecting" : "open") : "closed", rpcOk: this.rpcOk || 0, lastMsgAgo: this.lastMsg ? Date.now() - this.lastMsg : null, reconnects: this.reconnects || 0, lastErr: this.lastErr || null, errs: this.errs || null, ticks: this.tickN })
     }
     return json(404, { error: "not found" })
   }
