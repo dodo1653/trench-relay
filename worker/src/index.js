@@ -7,7 +7,7 @@ import { Buffer } from "node:buffer"
 import crypto from "node:crypto"
 
 const RPCS = ["https://solana-rpc.publicnode.com", "https://api.mainnet.solana.com", "https://api.mainnet-beta.solana.com"]   // the beta endpoint blocks Cloudflare
-const TICK_MS = 3000
+const TICK_MS = 2000
 const IDLE_MS = 10 * 60 * 1000
 const MAX_TRACK = 160
 const MIN_REAL_SOL = 0.1
