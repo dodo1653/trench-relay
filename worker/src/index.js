@@ -62,6 +62,13 @@ function curveOf(mint) {
 }
 
 // ---------------------------------------------------------------- the relay
+// DexScreener pairs we can price from: the coin is the BASE and the quote is wrapped SOL, so priceNative is SOL per coin
+// (a USDC pair or a pair where the coin is the quote would give a price in the wrong unit and a wild market cap)
+const WSOL = "So11111111111111111111111111111111111111112"
+function solPairs(pairs, mint) {
+  return (Array.isArray(pairs) ? pairs : []).filter((x) => x && x.baseToken && x.baseToken.address === mint && x.quoteToken && x.quoteToken.address === WSOL && +x.priceNative > 0)
+}
+
 export class Relay extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env)
@@ -189,7 +196,7 @@ export class Relay extends DurableObject {
         const r = await fetch("https://api.dexscreener.com/tokens/v1/solana/" + batch.map((c) => c.mint).join(","))
         const pairs = await r.json()
         for (const c of batch) {
-          const p = (Array.isArray(pairs) ? pairs : []).filter((x) => x.baseToken && x.baseToken.address === c.mint)
+          const p = solPairs(pairs, c.mint)
             .sort((a, b) => ((b.liquidity || {}).usd || 0) - ((a.liquidity || {}).usd || 0))[0]
           if (!p || !p.priceNative) continue
           const mc = +p.priceNative * 1e9
@@ -216,7 +223,7 @@ export class Relay extends DurableObject {
       } else {
         c.rSol = 85
         const r = await fetch("https://api.dexscreener.com/tokens/v1/solana/" + mint)
-        const p = ((await r.json()) || []).sort((a, b) => ((b.liquidity || {}).usd || 0) - ((a.liquidity || {}).usd || 0))[0]
+        const p = solPairs(await r.json(), mint).sort((a, b) => ((b.liquidity || {}).usd || 0) - ((a.liquidity || {}).usd || 0))[0]
         if (!p || !p.priceNative) return null
         c.name = p.baseToken.name.slice(0, 32); c.symbol = p.baseToken.symbol.slice(0, 12)
         this.tick(c, +p.priceNative * 1e9)
